@@ -1,0 +1,45 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "hot-type-game",
+  "post": {
+    "dir": "public",
+    "entrypoints": {
+      "default": {
+        "inline": true,
+        "entry": "splash.html"
+      },
+      "game": {
+        "entry": "game.html"
+      }
+    }
+  },
+  "server": {
+    "dir": "dist/server",
+    "entry": "index.js"
+  },
+  "menu": {
+    "items": [
+      {
+        "label": "Create a Hot Type post",
+        "description": "Daily touch-typing race on this community's top posts",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/post-create"
+      },
+      {
+        "label": "Refresh today's Hot Type posts",
+        "description": "Rebuild the cached post set from the subreddit's latest text posts",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/refresh-posts"
+      }
+    ]
+  },
+  "scripts": {
+    "dev": "node --experimental-strip-types ./tools/build.ts --watch",
+    "build": "node --experimental-strip-types ./tools/build.ts --minify"
+  },
+  "dev": {
+    "subreddit": "hot_type_game_dev"
+  }
+}

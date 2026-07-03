@@ -1,0 +1,17 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../dist/types/client",
+    "lib": ["DOM", "DOM.Iterable", "ES2023"],
+    "tsBuildInfoFile": "../dist/types/client/tsconfig.tsbuildinfo",
+    "customConditions": ["browser"],
+    "rootDir": "../src/client",
+    "jsx": "react-jsx",
+    "types": ["react", "react-dom"],
+    "isolatedDeclarations": false,
+    "noUnusedLocals": false
+  },
+  "include": ["../src/client/**/*"],
+  "exclude": ["../src/server/**/*"],
+  "references": [{ "path": "./tsconfig.shared.json" }]
+}
