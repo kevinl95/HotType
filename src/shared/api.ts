@@ -17,7 +17,7 @@ export type InitResponse = {
 // Client tells the server which post it's starting; the server stamps the start
 // time on its OWN clock and remembers the target text it served.
 export type StartRequest = { index: number };
-export type StartResponse = { type: "start"; ok: boolean };
+export type StartResponse = { type: "start"; ok: boolean; reason?: string };
 
 // The client no longer sends a WPM. It sends the raw evidence of the run and
 // the server recomputes the score authoritatively.
@@ -32,6 +32,7 @@ export type ScoreResponse = {
   leaderboard: LeaderEntry[];
   best: number;
   streak: number;
+  circuitComplete: boolean;
 };
 
 export const ApiEndpoint = {

@@ -21,6 +21,8 @@ const BOARD_MAX = 50;
 const POSTS_PER_DAY = 4;
 const SCORE_TX_RETRIES = 4;
 const POSTS_CACHE_VERSION = 3;
+const SCORE_STATE_VERSION = "v2";
+const CIRCUIT_STATE_VERSION = 1;
 const DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MIN_POST_TEXT = 40;
 const APP_POST_TITLE = "Hot Type — daily typing race";
@@ -56,13 +58,24 @@ export async function serverOnRequest(req: IncomingMessage, rsp: ServerResponse)
 
 /* ---------- keys ---------- */
 const postsKey = (sub: string, day: string) => `posts:${sub}:${day}`;
-const boardKey = (sub: string, day: string) => `lb:${sub}:${day}`;
-const bestKey = (user: string) => `best:${user}`;
-const streakKey = (user: string) => `streak:${user}`;
-const runKey = (user: string, postId: string) => `run:${user}:${postId}`;
+const boardKey = (sub: string, day: string, corpusId: string) => `lb:${SCORE_STATE_VERSION}:${sub}:${day}:${corpusId}`;
+const bestKey = (user: string) => `best:${SCORE_STATE_VERSION}:${user}`;
+const streakKey = (user: string) => `streak:${SCORE_STATE_VERSION}:${user}`;
+const circuitKey = (sub: string, day: string, user: string) => `circuit:${SCORE_STATE_VERSION}:${sub}:${day}:${user}`;
+const runKey = (sub: string, day: string, user: string) => `run:${SCORE_STATE_VERSION}:${sub}:${day}:${user}`;
 
 type StreakState = { streak: number; last: string };
 type CachedPosts = { version: number; posts: Post[] };
+type RunState = { startedAt: number; target: string; index: number };
+type CircuitState = {
+  version: number;
+  corpusId: string;
+  totalPosts: number;
+  nextIndex: number;
+  correct: number;
+  keystrokes: number;
+  elapsedMs: number;
+};
 
 function isCachedPosts(raw: unknown): raw is CachedPosts {
   return (
@@ -93,6 +106,64 @@ function parseStreakState(raw: string | undefined): StreakState | null {
     // Treat corrupt streak data as a cold start instead of crashing the request.
   }
   return null;
+}
+
+function parseRunState(raw: string | undefined): RunState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<RunState>;
+    if (
+      typeof parsed.startedAt === "number" &&
+      typeof parsed.target === "string" &&
+      typeof parsed.index === "number"
+    ) {
+      return { startedAt: parsed.startedAt, target: parsed.target, index: parsed.index };
+    }
+  } catch {
+    // Treat corrupt run data as missing.
+  }
+  return null;
+}
+
+function parseCircuitState(raw: string | undefined): CircuitState | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<CircuitState>;
+    if (
+      parsed.version === CIRCUIT_STATE_VERSION &&
+      typeof parsed.corpusId === "string" &&
+      typeof parsed.totalPosts === "number" &&
+      typeof parsed.nextIndex === "number" &&
+      typeof parsed.correct === "number" &&
+      typeof parsed.keystrokes === "number" &&
+      typeof parsed.elapsedMs === "number"
+    ) {
+      return {
+        version: parsed.version,
+        corpusId: parsed.corpusId,
+        totalPosts: parsed.totalPosts,
+        nextIndex: parsed.nextIndex,
+        correct: parsed.correct,
+        keystrokes: parsed.keystrokes,
+        elapsedMs: parsed.elapsedMs,
+      };
+    }
+  } catch {
+    // Treat corrupt circuit data as missing.
+  }
+  return null;
+}
+
+function newCircuitState(corpusId: string, totalPosts: number): CircuitState {
+  return {
+    version: CIRCUIT_STATE_VERSION,
+    corpusId,
+    totalPosts,
+    nextIndex: 0,
+    correct: 0,
+    keystrokes: 0,
+    elapsedMs: 0,
+  };
 }
 
 /* ---------- content ---------- */
@@ -147,6 +218,19 @@ function toTypeablePost(post: { title: string; body: string | undefined; score: 
 function currentSubredditName(): string | null {
   const sub = context.subredditName?.trim();
   return sub ? sub : null;
+}
+
+function hashText(text: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function corpusIdForPosts(posts: Post[]): string {
+  return hashText(posts.map((post) => `${post.title}\u001f${post.text}`).join("\u001e"));
 }
 
 // Profanity/slur guard so the game never renders hateful or obscene text, even
@@ -218,18 +302,26 @@ async function getDailyPosts(sub: string, day: string): Promise<Post[]> {
   return picked;
 }
 
-async function readBoard(sub: string, day: string): Promise<LeaderEntry[]> {
-  const rows = await redis.zRange(boardKey(sub, day), 0, 9, { reverse: true, by: "rank" });
+async function readBoard(sub: string, day: string, corpusId: string): Promise<LeaderEntry[]> {
+  const rows = await redis.zRange(boardKey(sub, day, corpusId), 0, 9, { reverse: true, by: "rank" });
   return rows.map((r) => ({ name: r.member, wpm: r.score }));
+}
+
+async function readPlayerStats(username: string): Promise<{ best: number; streak: number }> {
+  return {
+    best: Number((await redis.get(bestKey(username))) ?? 0),
+    streak: parseStreakState(await redis.get(streakKey(username)))?.streak ?? 0,
+  };
 }
 
 async function recordAcceptedScore(
   sub: string,
   day: string,
+  corpusId: string,
   username: string,
   wpm: number,
 ): Promise<{ best: number; streak: number }> {
-  const board = boardKey(sub, day);
+  const board = boardKey(sub, day, corpusId);
   const best = bestKey(username);
   const streak = streakKey(username);
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
@@ -305,12 +397,9 @@ async function onInit(): Promise<InitResponse> {
     return { type: "init", username, date: day, posts: [], leaderboard: [], best: 0, streak: 0 };
   }
 
-  const [posts, leaderboard, bestRaw, streakRaw] = await Promise.all([
-    getDailyPosts(sub, day),
-    readBoard(sub, day),
-    redis.get(bestKey(username)),
-    redis.get(streakKey(username)),
-  ]);
+  const posts = await getDailyPosts(sub, day);
+  const corpusId = corpusIdForPosts(posts);
+  const [leaderboard, stats] = await Promise.all([readBoard(sub, day, corpusId), readPlayerStats(username)]);
 
   return {
     type: "init",
@@ -318,8 +407,8 @@ async function onInit(): Promise<InitResponse> {
     date: day,
     posts,
     leaderboard,
-    best: Number(bestRaw ?? 0),
-    streak: parseStreakState(streakRaw)?.streak ?? 0,
+    best: stats.best,
+    streak: stats.streak,
   };
 }
 
@@ -327,54 +416,117 @@ async function onInit(): Promise<InitResponse> {
 // server records WHEN it happened (its own clock) and WHICH text was in play,
 // so neither value can be spoofed at submit time.
 async function onStart(req: IncomingMessage): Promise<StartResponse> {
+  const day = DAY();
   const username = context.username ?? "anon";
-  const postId = context.postId;
-  if (!postId) return { type: "start", ok: false };
-
   const { index } = await readJSON<StartRequest>(req).catch(() => ({ index: -1 }));
   const sub = currentSubredditName();
-  if (!sub) return { type: "start", ok: false };
-  const posts = await getDailyPosts(sub, DAY());
+  if (!sub) return { type: "start", ok: false, reason: "not in a subreddit" };
+
+  const posts = await getDailyPosts(sub, day);
   const post = posts[index];
-  if (!post) return { type: "start", ok: false };
+  if (!post) return { type: "start", ok: false, reason: "invalid post" };
+
+  const corpusId = corpusIdForPosts(posts);
+  const runStoreKey = runKey(sub, day, username);
+  const circuitStoreKey = circuitKey(sub, day, username);
+  const existingRun = parseRunState(await redis.get(runStoreKey));
+  const existingCircuit = parseCircuitState(await redis.get(circuitStoreKey));
+
+  const canReuseRun =
+    existingRun?.index === index &&
+    (index !== 0 || existingCircuit == null || existingCircuit.corpusId === corpusId);
+  if (canReuseRun) {
+    await redis.expire(runStoreKey, RUN_TTL);
+    return { type: "start", ok: true };
+  }
+
+  if (existingRun && index > 0) {
+    return { type: "start", ok: false, reason: "finish the current post first" };
+  }
+
+  if (index === 0) {
+    if (existingRun) await redis.del(runStoreKey);
+    await redis.set(circuitStoreKey, JSON.stringify(newCircuitState(corpusId, posts.length)));
+    await redis.expire(circuitStoreKey, TTL);
+  } else {
+    if (!existingCircuit) return { type: "start", ok: false, reason: "restart from the first post" };
+    if (existingCircuit.corpusId !== corpusId) {
+      return { type: "start", ok: false, reason: "today's post set changed; restart the circuit" };
+    }
+    if (existingCircuit.nextIndex !== index) {
+      return { type: "start", ok: false, reason: "finish the posts in order" };
+    }
+  }
 
   await redis.set(
-    runKey(username, postId),
-    JSON.stringify({ startedAt: Date.now(), target: post.text }),
+    runStoreKey,
+    JSON.stringify({ startedAt: Date.now(), target: post.text, index }),
   );
-  await redis.expire(runKey(username, postId), RUN_TTL);
+  await redis.expire(runStoreKey, RUN_TTL);
   return { type: "start", ok: true };
 }
 
 async function onScore(req: IncomingMessage): Promise<ScoreResponse> {
   const day = DAY();
   const username = context.username ?? "anon";
-  const postId = context.postId ?? "none";
   const sub = currentSubredditName();
   const body = await readJSON<ScoreRequest>(req).catch(() => ({ index: -1, typed: "", keystrokes: 0 }));
 
   if (!sub) {
-    return { type: "score", accepted: false, reason: "not in a subreddit", wpm: 0, acc: 0, leaderboard: [], best: 0, streak: 0 };
+    return {
+      type: "score",
+      accepted: false,
+      reason: "not in a subreddit",
+      wpm: 0,
+      acc: 0,
+      leaderboard: [],
+      best: 0,
+      streak: 0,
+      circuitComplete: false,
+    };
   }
 
-  const reject = async (reason: string): Promise<ScoreResponse> => ({
-    type: "score",
-    accepted: false,
-    reason,
-    wpm: 0,
-    acc: 0,
-    leaderboard: await readBoard(sub, day),
-    best: Number((await redis.get(bestKey(username))) ?? 0),
-    streak: parseStreakState(await redis.get(streakKey(username)))?.streak ?? 0,
-  });
+  const posts = await getDailyPosts(sub, day);
+  const currentCorpusId = corpusIdForPosts(posts);
+  const runStoreKey = runKey(sub, day, username);
+  const circuitStoreKey = circuitKey(sub, day, username);
 
-  // 1. There must be a live, un-redeemed run for this user + post.
-  const runRaw = await redis.get(runKey(username, postId));
+  const reject = async (reason: string, boardCorpusId = currentCorpusId): Promise<ScoreResponse> => {
+    const [leaderboard, stats] = await Promise.all([readBoard(sub, day, boardCorpusId), readPlayerStats(username)]);
+    return {
+      type: "score",
+      accepted: false,
+      reason,
+      wpm: 0,
+      acc: 0,
+      leaderboard,
+      best: stats.best,
+      streak: stats.streak,
+      circuitComplete: false,
+    };
+  };
+
+  // 1. There must be a live, un-redeemed run for this user.
+  const runRaw = await redis.get(runStoreKey);
   if (!runRaw) return reject("no active run");
-  const run = JSON.parse(runRaw) as { startedAt: number; target: string };
+  const run = parseRunState(runRaw);
+  if (!run) {
+    await redis.del(runStoreKey);
+    return reject("no active run");
+  }
+
+  const circuit = parseCircuitState(await redis.get(circuitStoreKey));
+  if (!circuit) {
+    await redis.del(runStoreKey);
+    return reject("restart from the first post");
+  }
+  if (run.index !== body.index || circuit.nextIndex !== body.index) {
+    await redis.del(runStoreKey);
+    return reject("finish the posts in order", circuit.corpusId);
+  }
 
   // 2. Burn the run immediately — single use, so a start can't be replayed.
-  await redis.del(runKey(username, postId));
+  await redis.del(runStoreKey);
 
   // 3. Score is computed from the SERVER's start time and the SERVER's target.
   const target = run.target;
@@ -384,19 +536,61 @@ async function onScore(req: IncomingMessage): Promise<ScoreResponse> {
   const keystrokes = Math.max(Number(body.keystrokes) || 0, correct);
 
   // 4. Plausibility gates.
-  if (typed.length < target.length) return reject("run not finished");
-  if (keystrokes < target.length) return reject("too few keystrokes");
-  if (elapsedMs < target.length * MIN_MS_PER_CHAR) return reject("impossibly fast");
+  if (typed.length < target.length) return reject("run not finished", circuit.corpusId);
+  if (keystrokes < target.length) return reject("too few keystrokes", circuit.corpusId);
+  if (elapsedMs < target.length * MIN_MS_PER_CHAR) return reject("impossibly fast", circuit.corpusId);
 
   const minutes = elapsedMs / 60000;
-  const wpm = Math.round(correct / 5 / minutes);
-  if (wpm <= 0 || wpm > MAX_WPM) return reject("out of range");
-  const acc = Math.max(0, Math.min(100, Math.round((correct / keystrokes) * 100)));
+  const segmentWpm = Math.round(correct / 5 / minutes);
+  if (segmentWpm <= 0 || segmentWpm > MAX_WPM) return reject("out of range", circuit.corpusId);
+  const segmentAcc = Math.max(0, Math.min(100, Math.round((correct / keystrokes) * 100)));
 
-  // 5. Record: best-of-day on the board, all-time best, daily streak.
-  const { best, streak } = await recordAcceptedScore(sub, day, username, wpm);
+  const nextCircuit: CircuitState = {
+    ...circuit,
+    nextIndex: circuit.nextIndex + 1,
+    correct: circuit.correct + correct,
+    keystrokes: circuit.keystrokes + keystrokes,
+    elapsedMs: circuit.elapsedMs + elapsedMs,
+  };
 
-  return { type: "score", accepted: true, wpm, acc, leaderboard: await readBoard(sub, day), best, streak };
+  if (nextCircuit.nextIndex < nextCircuit.totalPosts) {
+    await redis.set(circuitStoreKey, JSON.stringify(nextCircuit));
+    await redis.expire(circuitStoreKey, TTL);
+    const [leaderboard, stats] = await Promise.all([
+      readBoard(sub, day, circuit.corpusId),
+      readPlayerStats(username),
+    ]);
+    return {
+      type: "score",
+      accepted: true,
+      wpm: segmentWpm,
+      acc: segmentAcc,
+      leaderboard,
+      best: stats.best,
+      streak: stats.streak,
+      circuitComplete: false,
+    };
+  }
+
+  const totalMinutes = nextCircuit.elapsedMs / 60000;
+  const circuitWpm = Math.round(nextCircuit.correct / 5 / totalMinutes);
+  if (circuitWpm <= 0 || circuitWpm > MAX_WPM) return reject("out of range", circuit.corpusId);
+  const circuitAcc = Math.max(0, Math.min(100, Math.round((nextCircuit.correct / nextCircuit.keystrokes) * 100)));
+
+  // 5. Record only a completed full-set run on the board, plus all-time best and streak.
+  const { best, streak } = await recordAcceptedScore(sub, day, circuit.corpusId, username, circuitWpm);
+  await redis.del(circuitStoreKey);
+
+  return {
+    type: "score",
+    accepted: true,
+    wpm: circuitWpm,
+    acc: circuitAcc,
+    leaderboard: await readBoard(sub, day, circuit.corpusId),
+    best,
+    streak,
+    circuitComplete: true,
+  };
 }
 
 async function onMenuNewPost(): Promise<UiResponse> {

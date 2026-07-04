@@ -17,8 +17,9 @@ function chip(html: string, cls = ""): HTMLSpanElement {
   return el;
 }
 
-// Pull today's state so the feed card sells the race: who's fastest, your
-// streak, your best. This is the moment that earns the tap.
+// Pull today's state so the feed card sells the race: who's fastest on the
+// shared circuit, your streak, your best full run. This is the moment that
+// earns the tap.
 async function loadTeaser(): Promise<void> {
   try {
     const r = await fetch(ApiEndpoint.Init);
@@ -34,11 +35,11 @@ async function loadTeaser(): Promise<void> {
     const leader = d.leaderboard[0];
     teaser.appendChild(
       leader
-        ? chip(`top today &middot; u/${leader.name} &middot; <span class="mono">${leader.wpm}</span> wpm`)
-        : chip("be the first to set a time today"),
+        ? chip(`top circuit today &middot; u/${leader.name} &middot; <span class="mono">${leader.wpm}</span> wpm`)
+        : chip("be the first to finish today's full set"),
     );
     if (d.streak > 0) teaser.appendChild(chip(`🔥 ${d.streak}-day streak`, "fire"));
-    if (d.best > 0) teaser.appendChild(chip(`your best <span class="mono">${d.best}</span> wpm`));
+    if (d.best > 0) teaser.appendChild(chip(`your best full run <span class="mono">${d.best}</span> wpm`));
   } catch {
     // Card still works without live stats — the Start button is what matters.
   }

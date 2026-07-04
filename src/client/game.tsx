@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback, type ChangeEvent } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type ChangeEvent } from "react";
 import { createRoot } from "react-dom/client";
 import {
   ApiEndpoint,
@@ -48,30 +48,51 @@ function activeCharIndex(typed: string, target: string, status: RunStatus): numb
   return Math.min(typed.length, maxIndex);
 }
 
-function renderTargetText(target: string, typed: string, status: RunStatus) {
+function escapeTargetChar(ch: string): string {
+  switch (ch) {
+    case "&":
+      return "&amp;";
+    case "<":
+      return "&lt;";
+    case ">":
+      return "&gt;";
+    case '"':
+      return "&quot;";
+    case "'":
+      return "&#39;";
+    default:
+      return ch;
+  }
+}
+
+function buildTargetMarkup(target: string): string {
   const parts = target.match(/\S+\s*|\s+/g) ?? [];
   let charIndex = 0;
 
-  return parts.map((part, partIndex) => {
-    const chars = part.split("").map((ch) => {
-      const index = charIndex++;
-      let cls = "u";
-      if (index < typed.length) cls = eq(typed[index], ch) ? "ok" : "err";
-      else if (index === typed.length && status !== "done") cls = "cur";
+  return parts
+    .map((part) => {
+      const chars = part
+        .split("")
+        .map((ch) => {
+          const content = ch === " " ? "&nbsp;" : escapeTargetChar(ch);
+          return `<span id="ch${charIndex++}" class="c u">${content}</span>`;
+        })
+        .join("");
+      return `<span class="tok">${chars}</span>`;
+    })
+    .join("");
+}
 
-      return (
-        <span key={index} id={"ch" + index} className={"c " + cls}>
-          {ch === " " ? "\u00A0" : ch}
-        </span>
-      );
-    });
+function charClassName(index: number, typed: string, target: string, status: RunStatus): string {
+  let cls = "u";
+  if (index < typed.length) cls = eq(typed[index], target[index]) ? "ok" : "err";
+  else if (index === typed.length && status !== "done") cls = "cur";
+  return "c " + cls;
+}
 
-    return (
-      <span key={`token-${partIndex}`} className="tok">
-        {chars}
-      </span>
-    );
-  });
+function syncCharClass(node: HTMLElement, index: number, typed: string, target: string, status: RunStatus): void {
+  const next = charClassName(index, typed, target, status);
+  if (node.className !== next) node.className = next;
 }
 
 function HotType() {
@@ -91,11 +112,23 @@ function HotType() {
   const [keystrokes, setKeystrokes] = useState(0);
   const [errors, setErrors] = useState(0);
   const [finishWpm, setFinishWpm] = useState(0);
+  const [finishAcc, setFinishAcc] = useState(100);
+  const [finishAccepted, setFinishAccepted] = useState(false);
+  const [finishCircuitComplete, setFinishCircuitComplete] = useState(false);
+  const [finishBeatBest, setFinishBeatBest] = useState(false);
+  const [submittingScore, setSubmittingScore] = useState(false);
   const [showKb, setShowKb] = useState(() => canShowKeyboard());
 
   const inputRef = useRef<HTMLInputElement>(null);
+  const textRef = useRef<HTMLParagraphElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
+  const charEls = useRef<HTMLElement[]>([]);
+  const previousRender = useRef<{ target: string; typed: string; status: RunStatus }>({
+    target: "",
+    typed: "",
+    status: "idle",
+  });
   const particles = useRef<any[]>([]);
   const pending = useRef<{ index: number; type: string } | null>(null);
   const reduce = useRef(false);
@@ -106,6 +139,7 @@ function HotType() {
 
   const activePost = posts[idx];
   const target = activePost?.text ?? "";
+  const targetMarkup = useMemo(() => ({ __html: buildTargetMarkup(target) }), [target]);
 
   /* init from server */
   useEffect(() => {
@@ -261,6 +295,39 @@ function HotType() {
   }, [typed]);
 
   useLayoutEffect(() => {
+    const root = textRef.current;
+    charEls.current = root ? Array.from(root.querySelectorAll<HTMLElement>(".c")) : [];
+    for (let i = 0; i < charEls.current.length; i++) {
+      syncCharClass(charEls.current[i], i, typed, target, status);
+    }
+    previousRender.current = { target, typed, status };
+  }, [target, targetMarkup]);
+
+  useLayoutEffect(() => {
+    const nodes = charEls.current;
+    if (nodes.length === 0) return;
+
+    const previous = previousRender.current;
+    if (previous.target !== target) {
+      previousRender.current = { target, typed, status };
+      return;
+    }
+
+    const changed = new Set<number>();
+    const start = Math.max(0, Math.min(previous.typed.length, typed.length) - 1);
+    const end = Math.max(previous.typed.length, typed.length);
+    for (let i = start; i <= end; i++) changed.add(i);
+    changed.add(activeCharIndex(previous.typed, target, previous.status));
+    changed.add(activeCharIndex(typed, target, status));
+
+    for (const index of changed) {
+      if (index >= 0 && index < nodes.length) syncCharClass(nodes[index], index, typed, target, status);
+    }
+
+    previousRender.current = { target, typed, status };
+  }, [status, target, typed]);
+
+  useLayoutEffect(() => {
     if (!target || (typed.length === 0 && status === "idle")) return;
 
     const current = document.getElementById("ch" + activeCharIndex(typed, target, status));
@@ -326,7 +393,7 @@ function HotType() {
         body: JSON.stringify({ index: idx }),
       });
       const d = (await r.json()) as StartResponse;
-      if (d.type !== "start" || !d.ok) throw new Error("start rejected");
+      if (d.type !== "start" || !d.ok) throw new Error(d.reason ?? "couldn't start run");
 
       const startedAt = Date.now();
       startTimeRef.current = startedAt;
@@ -342,9 +409,14 @@ function HotType() {
       setKeystrokes(0);
       setErrors(0);
       setFinishWpm(0);
+      setFinishAcc(100);
+      setFinishAccepted(false);
+      setFinishCircuitComplete(false);
+      setFinishBeatBest(false);
+      setSubmittingScore(false);
       ksRef.current = 0;
       syncInputValue("");
-      setRejected("couldn't start run");
+      setRejected(e instanceof Error ? e.message : "couldn't start run");
     }
   }
 
@@ -405,14 +477,21 @@ function HotType() {
   const minutes = Math.max((now - (startTime || now)) / 60000, 1 / 600);
   const liveWpm = startTime ? Math.max(0, Math.round(correctCount(typed) / 5 / minutes)) : 0;
   const accuracy = keystrokes ? Math.round(((keystrokes - errors) / keystrokes) * 100) : 100;
+  const displayAccuracy = status === "done" ? finishAcc : accuracy;
 
   async function finish(finalTyped: string) {
     setStatus("done");
+    setSubmittingScore(true);
+    setFinishAccepted(false);
+    setFinishCircuitComplete(false);
+    setFinishBeatBest(false);
     // Optimistic local number for instant feedback; the server's value wins.
     const localStart = startTimeRef.current ?? startTime ?? Date.now();
     const localMin = Math.max((Date.now() - localStart) / 60000, 1 / 600);
     setFinishWpm(Math.max(0, Math.round(correctCount(finalTyped) / 5 / localMin)));
+    setFinishAcc(Math.max(0, Math.min(100, Math.round((correctCount(finalTyped) / Math.max(ksRef.current, 1)) * 100))));
     try {
+      const bestBeforeSubmit = best;
       const r = await fetch(ApiEndpoint.Score, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -423,16 +502,24 @@ function HotType() {
         setBoard(d.leaderboard);
         setBest(d.best);
         setStreak(d.streak);
+        setFinishAcc(d.acc);
+        setFinishCircuitComplete(d.circuitComplete);
         if (d.accepted) {
+          setFinishAccepted(true);
+          setFinishBeatBest(d.circuitComplete && d.wpm > bestBeforeSubmit);
           setFinishWpm(d.wpm); // authoritative score replaces the local guess
           setRejected(null);
         } else {
+          setFinishAccepted(false);
           setRejected(d.reason ?? "not recorded");
         }
       }
     } catch (e) {
       console.error("score submit failed", e);
+      setFinishAccepted(false);
       setRejected("network error");
+    } finally {
+      setSubmittingScore(false);
     }
   }
 
@@ -444,6 +531,11 @@ function HotType() {
     setKeystrokes(0);
     setErrors(0);
     setFinishWpm(0);
+    setFinishAcc(100);
+    setFinishAccepted(false);
+    setFinishCircuitComplete(false);
+    setFinishBeatBest(false);
+    setSubmittingScore(false);
     setRejected(null);
     ksRef.current = 0;
     if (inputRef.current) {
@@ -452,13 +544,19 @@ function HotType() {
     }
   }, []);
   const hasNextPost = idx < posts.length - 1;
+  const canAdvance = finishAccepted && !submittingScore && hasNextPost;
+  const restartCircuit = useCallback(() => {
+    setIdx(0);
+    reset();
+  }, [reset]);
   const nextPost = () => {
-    if (!hasNextPost) return;
+    if (!canAdvance) return;
     setIdx((i) => Math.min(i + 1, posts.length - 1));
     reset();
   };
   const focusInput = () => inputRef.current?.focus();
   const nextChar = status === "done" ? null : target[typed.length];
+  const remainingPosts = Math.max(posts.length - idx - 1, 0);
 
   if (!loaded) return <div className={`ht-root ht-${layout} ht-center`}>loading today's posts…</div>;
   if (posts.length === 0)
@@ -489,7 +587,7 @@ function HotType() {
         <div className="ht-primary">
           <section className="ht-surface" ref={surfaceRef}>
             <canvas ref={canvasRef} className="ht-canvas" />
-            <p className="ht-text">{renderTargetText(target, typed, status)}</p>
+            <p ref={textRef} className="ht-text" dangerouslySetInnerHTML={targetMarkup} />
             <input
               ref={inputRef}
               className="ht-input"
@@ -521,27 +619,33 @@ function HotType() {
               <span className="num" style={{ color: "#ff4500" }}>{status === "done" ? finishWpm : liveWpm}</span>
               <span className="lbl">wpm</span>
             </div>
-            <div className="stat"><span className="num">{accuracy}</span><span className="lbl">% acc</span></div>
-            <div className="stat"><span className="num">{best}</span><span className="lbl">best</span></div>
+            <div className="stat"><span className="num">{displayAccuracy}</span><span className="lbl">% acc</span></div>
+            <div className="stat"><span className="num">{best}</span><span className="lbl">best run</span></div>
             <div className="bar"><div className="bar-fill" style={{ width: `${(typed.length / target.length) * 100}%` }} /></div>
           </div>
 
           {status === "done" && (
             <div className="ht-done">
               <span>
-                {finishWpm} wpm <span className="dot">·</span> {accuracy}% accurate
+                {finishWpm} wpm <span className="dot">·</span> {finishAcc}% accurate
                 {rejected ? (
                   <span className="reject"> · not recorded ({rejected})</span>
-                ) : finishWpm >= best && finishWpm > 0 ? (
-                  "  — new best!"
+                ) : submittingScore ? (
+                  <span className="queued"> · recording…</span>
+                ) : finishCircuitComplete ? (
+                  finishBeatBest ? "  - new circuit best!" : <span className="queued"> · full circuit recorded</span>
+                ) : finishAccepted ? (
+                  <span className="queued"> · post cleared; {remainingPosts} to go for the board</span>
                 ) : (
                   ""
                 )}
               </span>
               <div className="ht-actions">
-                <button className="btn ghost" onClick={reset}>retry</button>
-                <button className="btn" onClick={nextPost} disabled={!hasNextPost}>
-                  {hasNextPost ? "next post →" : "done for today"}
+                <button className="btn ghost" onClick={finishAccepted ? restartCircuit : reset} disabled={submittingScore}>
+                  {finishAccepted ? (finishCircuitComplete ? "run again" : "restart circuit") : "retry post"}
+                </button>
+                <button className="btn" onClick={nextPost} disabled={!canAdvance}>
+                  {submittingScore ? "recording..." : hasNextPost ? "next post →" : "done for today"}
                 </button>
               </div>
             </div>
@@ -570,7 +674,7 @@ function HotType() {
           <footer className="ht-foot">
             <div className="lb">
               <div className="lb-title">
-                today's leaderboard
+                today's circuit leaderboard
                 {canShowKeyboard() && (
                   <button className="kb-toggle" onClick={() => setShowKb((s) => !s)}>{showKb ? "hide keys" : "show keys"}</button>
                 )}
@@ -578,7 +682,7 @@ function HotType() {
               {board === null ? (
                 <div className="lb-empty">loading…</div>
               ) : board.length === 0 ? (
-                <div className="lb-empty">be the first to set a time today</div>
+                <div className="lb-empty">be the first to finish the full set today</div>
               ) : (
                 <ol className="lb-list">
                   {board.slice(0, 6).map((e, i) => (
@@ -594,7 +698,7 @@ function HotType() {
             <div className="handle">
               <label>playing as</label>
               <div className="who-name">u/{username}</div>
-              <p className="note">your fastest run today shows on the community board</p>
+              <p className="note">your fastest full-set run shows on the community board</p>
             </div>
           </footer>
         </aside>
@@ -651,6 +755,7 @@ const CSS = `
 .ht-done{margin-top:18px;font-size:14.5px;font-weight:500;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
 .ht-done .dot{color:var(--muted);margin:0 4px;}
 .ht-done .reject{color:var(--blue);font-weight:600;}
+.ht-done .queued{color:#8a8e93;font-weight:600;}
 .ht-actions{display:flex;gap:8px;}
 .btn{font-family:inherit;font-weight:600;font-size:13.5px;border:0;border-radius:99px;padding:9px 18px;background:var(--orange);color:#fff;cursor:pointer;}
 .btn.ghost{background:var(--soft);color:var(--ink);}
