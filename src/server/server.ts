@@ -20,10 +20,9 @@ const RUN_TTL = 60 * 10; // a run must be finished within 10 minutes
 const BOARD_MAX = 50;
 const POSTS_PER_DAY = 4;
 const SCORE_TX_RETRIES = 4;
-const POSTS_CACHE_VERSION = 1;
+const POSTS_CACHE_VERSION = 3;
 const DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MIN_POST_TEXT = 40;
-const MAX_POST_TEXT = 3000;
 const APP_POST_TITLE = "Hot Type — daily typing race";
 
 // Plausibility bounds for the server-recomputed score.
@@ -139,10 +138,15 @@ function toTypeablePost(post: { title: string; body: string | undefined; score: 
   if (!rawBody) return null;
 
   const text = getTypeablePostText(rawBody);
-  if (text.length < MIN_POST_TEXT || text.length > MAX_POST_TEXT) return null;
+  if (text.length < MIN_POST_TEXT) return null;
   if (!isClean(post.title) || !isClean(rawBody) || !isClean(text)) return null;
 
   return { sub, title: post.title.trim(), text, score: post.score };
+}
+
+function currentSubredditName(): string | null {
+  const sub = context.subredditName?.trim();
+  return sub ? sub : null;
 }
 
 // Profanity/slur guard so the game never renders hateful or obscene text, even
@@ -233,6 +237,8 @@ async function recordAcceptedScore(
   for (let attempt = 0; attempt < SCORE_TX_RETRIES; attempt++) {
     const tx = await redis.watch(board, best, streak);
     try {
+      // Devvit queues tx-client reads until EXEC, so the optimistic read phase
+      // must stay on the base client after WATCH.
       const existing = await redis.zScore(board, username);
       const bestRaw = await redis.get(best);
       const currentBest = Number(bestRaw ?? 0);
@@ -293,7 +299,11 @@ function correctChars(typed: string, target: string): number {
 async function onInit(): Promise<InitResponse> {
   const day = DAY();
   const username = context.username ?? "anon";
-  const sub = context.subredditName;
+  const sub = currentSubredditName();
+
+  if (!sub) {
+    return { type: "init", username, date: day, posts: [], leaderboard: [], best: 0, streak: 0 };
+  }
 
   const [posts, leaderboard, bestRaw, streakRaw] = await Promise.all([
     getDailyPosts(sub, day),
@@ -322,7 +332,8 @@ async function onStart(req: IncomingMessage): Promise<StartResponse> {
   if (!postId) return { type: "start", ok: false };
 
   const { index } = await readJSON<StartRequest>(req).catch(() => ({ index: -1 }));
-  const sub = context.subredditName;
+  const sub = currentSubredditName();
+  if (!sub) return { type: "start", ok: false };
   const posts = await getDailyPosts(sub, DAY());
   const post = posts[index];
   if (!post) return { type: "start", ok: false };
@@ -339,8 +350,12 @@ async function onScore(req: IncomingMessage): Promise<ScoreResponse> {
   const day = DAY();
   const username = context.username ?? "anon";
   const postId = context.postId ?? "none";
-  const sub = context.subredditName;
+  const sub = currentSubredditName();
   const body = await readJSON<ScoreRequest>(req).catch(() => ({ index: -1, typed: "", keystrokes: 0 }));
+
+  if (!sub) {
+    return { type: "score", accepted: false, reason: "not in a subreddit", wpm: 0, acc: 0, leaderboard: [], best: 0, streak: 0 };
+  }
 
   const reject = async (reason: string): Promise<ScoreResponse> => ({
     type: "score",
@@ -385,12 +400,20 @@ async function onScore(req: IncomingMessage): Promise<ScoreResponse> {
 }
 
 async function onMenuNewPost(): Promise<UiResponse> {
+  if (!currentSubredditName()) {
+    return { showToast: { text: "This post must be created from a subreddit", appearance: "neutral" } };
+  }
+
   const post = await reddit.submitCustomPost({ title: APP_POST_TITLE });
   return { showToast: { text: `Created ${post.id}`, appearance: "success" }, navigateTo: post.url };
 }
 
 async function onMenuRefreshPosts(): Promise<UiResponse> {
-  const sub = context.subredditName;
+  const sub = currentSubredditName();
+  if (!sub) {
+    return { showToast: { text: "This action needs a subreddit context", appearance: "neutral" } };
+  }
+
   const day = DAY();
   await redis.del(postsKey(sub, day));
   const posts = await getDailyPosts(sub, day);

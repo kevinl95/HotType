@@ -292,16 +292,24 @@ function HotType() {
     const animate = options?.animate ?? true;
 
     if (val.length > previous.length) {
-      const i = val.length - 1;
-      const correct = eq(val[i], target[i]);
-      ksRef.current += 1;
-      setKeystrokes((k) => k + 1);
-      if (!correct) {
-        setErrors((x) => x + 1);
-        if (animate) pending.current = { index: i, type: "err" };
-      } else if (animate && (target[i] === " " || i === target.length - 1)) {
-        pending.current = { index: i, type: "ok" };
+      const inserted = val.length - previous.length;
+      let errorCount = 0;
+      let lastPending: { index: number; type: string } | null = null;
+
+      for (let i = previous.length; i < val.length; i++) {
+        const correct = eq(val[i], target[i]);
+        if (!correct) {
+          errorCount += 1;
+          if (animate) lastPending = { index: i, type: "err" };
+        } else if (animate && (target[i] === " " || i === target.length - 1)) {
+          lastPending = { index: i, type: "ok" };
+        }
       }
+
+      ksRef.current += inserted;
+      setKeystrokes((k) => k + inserted);
+      if (errorCount > 0) setErrors((x) => x + errorCount);
+      if (lastPending) pending.current = lastPending;
     }
     setTypedValue(val);
     setNow(Date.now());
@@ -344,6 +352,8 @@ function HotType() {
     if (status === "done" || !target) return;
 
     const previous = typedRef.current;
+    const nativeEvent = e.nativeEvent as Event & { inputType?: string };
+    const inputType = nativeEvent.inputType;
 
     let val = e.target.value;
     if (val.length > target.length) val = val.slice(0, target.length);
@@ -355,15 +365,22 @@ function HotType() {
 
     const delta = val.length - previous.length;
     if (delta > 1) {
-      syncInputValue(previous);
-      setRejected("paste is disabled");
-      return;
+      if (inputType === "insertFromPaste" || inputType === "insertFromDrop") {
+        syncInputValue(previous);
+        setRejected("paste is disabled");
+        return;
+      }
+      if (!target.startsWith(val)) {
+        syncInputValue(previous);
+        setRejected("bulk input must match the post text");
+        return;
+      }
     }
 
     setRejected(null);
 
     if (status === "idle") {
-      if (delta !== 1) {
+      if (delta <= 0) {
         syncInputValue(previous);
         return;
       }
