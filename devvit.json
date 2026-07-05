@@ -13,6 +13,9 @@
       }
     }
   },
+  "marketingAssets": {
+    "icon": "assets/icon.png"
+  },
   "server": {
     "dir": "dist/server",
     "entry": "index.js"
