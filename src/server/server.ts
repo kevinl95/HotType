@@ -2,11 +2,13 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { once } from "node:events";
 import { context, reddit, redis } from "@devvit/web/server";
 import type { PartialJsonValue, UiResponse } from "@devvit/web/shared";
+import { BUNDLED_FALLBACK_PASSAGES } from "./fallback-corpus.ts";
 import {
   ApiEndpoint,
   type InitResponse,
   type LeaderEntry,
   type Post,
+  type PostOrigin,
   type ScoreRequest,
   type ScoreResponse,
   type StartRequest,
@@ -20,7 +22,7 @@ const RUN_TTL = 60 * 10; // a run must be finished within 10 minutes
 const BOARD_MAX = 50;
 const POSTS_PER_DAY = 4;
 const SCORE_TX_RETRIES = 4;
-const POSTS_CACHE_VERSION = 3;
+const POSTS_CACHE_VERSION = 5;
 const SCORE_STATE_VERSION = "v2";
 const CIRCUIT_STATE_VERSION = 1;
 const DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -67,6 +69,16 @@ const runKey = (sub: string, day: string, user: string) => `run:${SCORE_STATE_VE
 type StreakState = { streak: number; last: string };
 type CachedPosts = { version: number; posts: Post[] };
 type RunState = { startedAt: number; target: string; index: number };
+type CorpusCandidate = {
+  id: string;
+  title: string;
+  body: string | undefined;
+  score: number;
+  stickied?: boolean;
+  nsfw?: boolean;
+  removed?: boolean;
+  createdAt?: Date;
+};
 type CircuitState = {
   version: number;
   corpusId: string;
@@ -76,6 +88,16 @@ type CircuitState = {
   keystrokes: number;
   elapsedMs: number;
 };
+
+function isPostOrigin(value: unknown): value is PostOrigin {
+  return (
+    value === "top-day" ||
+    value === "new-recent" ||
+    value === "top-week" ||
+    value === "top-month" ||
+    value === "bundled-fallback"
+  );
+}
 
 function isCachedPosts(raw: unknown): raw is CachedPosts {
   return (
@@ -90,7 +112,8 @@ function isCachedPosts(raw: unknown): raw is CachedPosts {
         typeof (post as Post).sub === "string" &&
         typeof (post as Post).title === "string" &&
         typeof (post as Post).text === "string" &&
-        typeof (post as Post).score === "number",
+        typeof (post as Post).score === "number" &&
+        isPostOrigin((post as Post).origin),
     )
   );
 }
@@ -202,7 +225,86 @@ function isRecentPost(date: Date, nowMs: number): boolean {
   return nowMs - date.getTime() <= DAY_WINDOW_MS;
 }
 
-function toTypeablePost(post: { title: string; body: string | undefined; score: number }, sub: string): Post | null {
+function describeCorpus(posts: Post[]): { corpusDescription: string; usesFallback: boolean } {
+  const usesFallback = posts.some((post) => post.origin === "bundled-fallback");
+  if (posts.length === 0) {
+    return {
+      corpusDescription: "Hot Type builds a daily circuit from qualifying text posts in this subreddit.",
+      usesFallback: false,
+    };
+  }
+
+  const uniqueOrigins = new Set(posts.map((post) => post.origin));
+  if (uniqueOrigins.size === 1) {
+    switch (posts[0].origin) {
+      case "top-day":
+        return {
+          corpusDescription: "Hot Type builds today's circuit from today's top text posts in this subreddit.",
+          usesFallback: false,
+        };
+      case "new-recent":
+        return {
+          corpusDescription: "Hot Type builds today's circuit from this subreddit's most recent qualifying text posts.",
+          usesFallback: false,
+        };
+      case "top-week":
+        return {
+          corpusDescription: "Hot Type builds today's circuit from this subreddit's top text posts from the past week.",
+          usesFallback: false,
+        };
+      case "top-month":
+        return {
+          corpusDescription: "Hot Type builds today's circuit from this subreddit's top text posts from the past month.",
+          usesFallback: false,
+        };
+      case "bundled-fallback":
+        return {
+          corpusDescription: "Hot Type normally builds a daily circuit from this subreddit's text posts. This subreddit could not fill one today, so the game is using clearly marked fallback practice passages.",
+          usesFallback: true,
+        };
+    }
+  }
+
+  if (usesFallback) {
+    return {
+      corpusDescription: "Hot Type builds today's circuit from this subreddit's qualifying text posts and uses clearly marked fallback practice passages only for any missing slots.",
+      usesFallback: true,
+    };
+  }
+
+  return {
+    corpusDescription: "Hot Type builds today's circuit from this subreddit's qualifying recent and top text posts.",
+    usesFallback: false,
+  };
+}
+
+function appendPosts(
+  picked: Post[],
+  seen: Set<string>,
+  posts: readonly CorpusCandidate[],
+  sub: string,
+  nowMs: number,
+  origin: PostOrigin,
+  options?: { recentOnly?: boolean },
+): number {
+  const before = picked.length;
+  const recentOnly = options?.recentOnly ?? false;
+
+  for (const post of posts) {
+    if (picked.length >= POSTS_PER_DAY) break;
+    if (seen.has(post.id)) continue;
+    seen.add(post.id);
+    if (post.stickied || post.nsfw || post.removed) continue;
+    if (recentOnly && (!post.createdAt || !isRecentPost(post.createdAt, nowMs))) continue;
+
+    const candidate = toTypeablePost(post, sub, origin);
+    if (candidate) picked.push(candidate);
+  }
+
+  return picked.length - before;
+}
+
+function toTypeablePost(post: { title: string; body: string | undefined; score: number }, sub: string, origin: PostOrigin): Post | null {
   if (post.title === APP_POST_TITLE) return null;
 
   const rawBody = post.body?.trim();
@@ -212,7 +314,7 @@ function toTypeablePost(post: { title: string; body: string | undefined; score: 
   if (text.length < MIN_POST_TEXT) return null;
   if (!isClean(post.title) || !isClean(rawBody) || !isClean(text)) return null;
 
-  return { sub, title: post.title.trim(), text, score: post.score };
+  return { sub, title: post.title.trim(), text, score: post.score, origin };
 }
 
 function currentSubredditName(): string | null {
@@ -266,35 +368,62 @@ async function getDailyPosts(sub: string, day: string): Promise<Post[]> {
     await redis.del(postsKey(sub, day));
   }
 
-  const raw = await reddit
-    .getTopPosts({ subredditName: sub, timeframe: "day", limit: 30 })
-    .all();
-
   const picked: Post[] = [];
   const seen = new Set<string>();
   const nowMs = Date.now();
 
-  const appendPosts = (
-    posts: Array<{ id: string; title: string; body: string | undefined; score: number; stickied: boolean; nsfw: boolean; removed: boolean; createdAt: Date }>,
-    recentOnly: boolean,
-  ) => {
-    for (const post of posts) {
-      if (picked.length >= POSTS_PER_DAY) break;
-      if (seen.has(post.id)) continue;
-      seen.add(post.id);
-      if (post.stickied || post.nsfw || post.removed) continue;
-      if (recentOnly && !isRecentPost(post.createdAt, nowMs)) continue;
+  const sources: Array<{
+    name: string;
+    origin: PostOrigin;
+    recentOnly?: boolean;
+    load: () => Promise<readonly CorpusCandidate[]>;
+  }> = [
+    {
+      name: "top/day",
+      origin: "top-day",
+      load: async () => await reddit.getTopPosts({ subredditName: sub, timeframe: "day", limit: 30 }).all(),
+    },
+    {
+      name: "new/recent",
+      origin: "new-recent",
+      recentOnly: true,
+      load: async () => await reddit.getNewPosts({ subredditName: sub, limit: 50 }).all(),
+    },
+    {
+      name: "top/week",
+      origin: "top-week",
+      load: async () => await reddit.getTopPosts({ subredditName: sub, timeframe: "week", limit: 50 }).all(),
+    },
+    {
+      name: "top/month",
+      origin: "top-month",
+      load: async () => await reddit.getTopPosts({ subredditName: sub, timeframe: "month", limit: 50 }).all(),
+    },
+    {
+      name: "bundled/fallback",
+      origin: "bundled-fallback",
+      load: async () => BUNDLED_FALLBACK_PASSAGES,
+    },
+  ];
 
-      const candidate = toTypeablePost(post, sub);
-      if (candidate) picked.push(candidate);
+  let lastSourceUsed = "none";
+
+  for (const source of sources) {
+    if (picked.length >= POSTS_PER_DAY) break;
+
+    try {
+      const sourcePosts = await source.load();
+      const added = appendPosts(picked, seen, sourcePosts, sub, nowMs, source.origin, { recentOnly: source.recentOnly });
+      if (added > 0) lastSourceUsed = source.name;
+    } catch (err) {
+      console.error(`failed to load corpus source ${source.name} for r/${sub}`, err);
     }
-  };
-
-  appendPosts(raw, false);
+  }
 
   if (picked.length < POSTS_PER_DAY) {
-    const fresh = await reddit.getNewPosts({ subredditName: sub, limit: 50 }).all();
-    appendPosts(fresh, true);
+    console.warn(`daily corpus for r/${sub} on ${day} only produced ${picked.length}/${POSTS_PER_DAY} posts`);
+  } else {
+    console.log(`daily corpus for r/${sub} on ${day} filled via ${lastSourceUsed}`);
   }
 
   await redis.set(postsKey(sub, day), JSON.stringify({ version: POSTS_CACHE_VERSION, posts: picked }));
@@ -394,12 +523,23 @@ async function onInit(): Promise<InitResponse> {
   const sub = currentSubredditName();
 
   if (!sub) {
-    return { type: "init", username, date: day, posts: [], leaderboard: [], best: 0, streak: 0 };
+    return {
+      type: "init",
+      username,
+      date: day,
+      posts: [],
+      leaderboard: [],
+      best: 0,
+      streak: 0,
+      corpusDescription: "Hot Type builds a daily circuit from qualifying text posts in the current subreddit.",
+      usesFallback: false,
+    };
   }
 
   const posts = await getDailyPosts(sub, day);
   const corpusId = corpusIdForPosts(posts);
   const [leaderboard, stats] = await Promise.all([readBoard(sub, day, corpusId), readPlayerStats(username)]);
+  const corpus = describeCorpus(posts);
 
   return {
     type: "init",
@@ -409,6 +549,8 @@ async function onInit(): Promise<InitResponse> {
     leaderboard,
     best: stats.best,
     streak: stats.streak,
+    corpusDescription: corpus.corpusDescription,
+    usesFallback: corpus.usesFallback,
   };
 }
 

@@ -1,7 +1,8 @@
 // Shared types + endpoint names. Imported by BOTH client and server so the
 // request/response shapes can never drift apart.
 
-export type Post = { sub: string; title: string; text: string; score: number };
+export type PostOrigin = "top-day" | "new-recent" | "top-week" | "top-month" | "bundled-fallback";
+export type Post = { sub: string; title: string; text: string; score: number; origin: PostOrigin };
 export type LeaderEntry = { name: string; wpm: number };
 
 export type InitResponse = {
@@ -12,6 +13,8 @@ export type InitResponse = {
   leaderboard: LeaderEntry[];
   best: number;
   streak: number;
+  corpusDescription: string;
+  usesFallback: boolean;
 };
 
 // Client tells the server which post it's starting; the server stamps the start

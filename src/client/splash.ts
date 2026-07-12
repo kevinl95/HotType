@@ -27,6 +27,7 @@ async function loadTeaser(): Promise<void> {
     if (d.type !== "init") return;
 
     teaser.replaceChildren();
+    hook.textContent = d.corpusDescription;
 
     if (d.posts.length === 0) {
       hook.textContent = "fresh posts are landing — check back soon.";
@@ -38,6 +39,7 @@ async function loadTeaser(): Promise<void> {
         ? chip(`top circuit today &middot; u/${leader.name} &middot; <span class="mono">${leader.wpm}</span> wpm`)
         : chip("be the first to finish today's full set"),
     );
+    if (d.usesFallback) teaser.appendChild(chip("fallback passages are clearly marked", "note"));
     if (d.streak > 0) teaser.appendChild(chip(`🔥 ${d.streak}-day streak`, "fire"));
     if (d.best > 0) teaser.appendChild(chip(`your best full run <span class="mono">${d.best}</span> wpm`));
   } catch {

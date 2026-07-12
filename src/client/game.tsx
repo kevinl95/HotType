@@ -5,6 +5,7 @@ import {
   type InitResponse,
   type LeaderEntry,
   type Post,
+  type PostOrigin,
   type ScoreResponse,
   type StartResponse,
 } from "../shared/api.ts";
@@ -95,6 +96,21 @@ function syncCharClass(node: HTMLElement, index: number, typed: string, target: 
   if (node.className !== next) node.className = next;
 }
 
+function originLabel(origin: PostOrigin): string {
+  switch (origin) {
+    case "top-day":
+      return "today's top text post";
+    case "new-recent":
+      return "recent text post";
+    case "top-week":
+      return "top text post this week";
+    case "top-month":
+      return "top text post this month";
+    case "bundled-fallback":
+      return "fallback practice passage";
+  }
+}
+
 function HotType() {
   const [posts, setPosts] = useState<Post[]>([]);
   const [username, setUsername] = useState("anon");
@@ -103,6 +119,7 @@ function HotType() {
   const [streak, setStreak] = useState(0);
   const [loaded, setLoaded] = useState(false);
   const [layout, setLayout] = useState<LayoutMode>(() => detectLayoutMode());
+  const [corpusDescription, setCorpusDescription] = useState("Hot Type builds a daily circuit from qualifying text posts in this subreddit.");
 
   const [idx, setIdx] = useState(0);
   const [typed, setTyped] = useState("");
@@ -154,6 +171,7 @@ function HotType() {
           setBoard(d.leaderboard);
           setBest(d.best);
           setStreak(d.streak);
+          setCorpusDescription(d.corpusDescription);
         }
       } catch (e) {
         console.error("init failed", e);
@@ -557,6 +575,7 @@ function HotType() {
   const focusInput = () => inputRef.current?.focus();
   const nextChar = status === "done" ? null : target[typed.length];
   const remainingPosts = Math.max(posts.length - idx - 1, 0);
+  const isFallbackPost = activePost?.origin === "bundled-fallback";
 
   if (!loaded) return <div className={`ht-root ht-${layout} ht-center`}>loading today's posts…</div>;
   if (posts.length === 0)
@@ -577,9 +596,23 @@ function HotType() {
       </header>
 
       <div className="ht-eyebrow">
-        r/{activePost.sub} <span className="dot">·</span> today's text post <span className="dot">·</span>{" "}
-        {fmt(activePost.score)} upvotes <span className="dot">·</span> post {idx + 1}/{posts.length}
+        {isFallbackPost ? (
+          <>
+            <span className="ht-badge">fallback passage</span>
+            <span className="dot">·</span>
+            built in because r/{activePost.sub} could not fill today's circuit
+            <span className="dot">·</span>
+            post {idx + 1}/{posts.length}
+          </>
+        ) : (
+          <>
+            r/{activePost.sub} <span className="dot">·</span> {originLabel(activePost.origin)} <span className="dot">·</span>{" "}
+            {fmt(activePost.score)} upvotes <span className="dot">·</span> post {idx + 1}/{posts.length}
+          </>
+        )}
       </div>
+
+      <p className="ht-corpus-note">{corpusDescription}</p>
 
       <h2 className="ht-post-title">{activePost.title}</h2>
 
@@ -724,6 +757,8 @@ const CSS = `
 .ht-streak{font-size:12.5px;color:#8a8e93;font-weight:500;}
 .ht-eyebrow{font-size:13px;color:#8a8e93;margin-bottom:14px;font-weight:500;}
 .ht-eyebrow .dot{color:var(--muted);margin:0 4px;}
+.ht-badge{display:inline-flex;align-items:center;padding:3px 8px;border-radius:999px;background:#fff4ee;color:var(--orange);font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;vertical-align:middle;}
+.ht-corpus-note{font-size:12.5px;line-height:1.45;color:#8a8e93;font-weight:500;max-width:58ch;margin:0 0 14px;}
 .ht-post-title{font-size:22px;line-height:1.25;letter-spacing:-0.02em;margin:0 0 18px;max-width:24ch;}
 .ht-main{display:flex;flex-direction:column;gap:26px;}
 .ht-primary,.ht-secondary{min-width:0;}
