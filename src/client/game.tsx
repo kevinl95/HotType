@@ -135,6 +135,7 @@ function HotType() {
   const [finishBeatBest, setFinishBeatBest] = useState(false);
   const [submittingScore, setSubmittingScore] = useState(false);
   const [showKb, setShowKb] = useState(() => canShowKeyboard());
+  const [kbPinned, setKbPinned] = useState(false);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const textRef = useRef<HTMLParagraphElement>(null);
@@ -189,7 +190,11 @@ function HotType() {
 
     const sync = () => {
       setLayout(detectLayoutMode());
-      if (!keyboardMedia.matches) setShowKb(false);
+      if (!keyboardMedia.matches) {
+        setShowKb(false);
+        return;
+      }
+      if (!kbPinned) setShowKb(true);
     };
     sync();
 
@@ -208,7 +213,7 @@ function HotType() {
       layoutMedia.removeListener(sync);
       keyboardMedia.removeListener(sync);
     };
-  }, []);
+  }, [kbPinned]);
 
   useEffect(() => {
     if (loaded && posts.length > 0) inputRef.current?.focus();
@@ -576,6 +581,10 @@ function HotType() {
   const nextChar = status === "done" ? null : target[typed.length];
   const remainingPosts = Math.max(posts.length - idx - 1, 0);
   const isFallbackPost = activePost?.origin === "bundled-fallback";
+  const toggleKeyboard = () => {
+    setKbPinned(true);
+    setShowKb((s) => !s);
+  };
 
   if (!loaded) return <div className={`ht-root ht-${layout} ht-center`}>loading today's posts…</div>;
   if (posts.length === 0)
@@ -709,7 +718,7 @@ function HotType() {
               <div className="lb-title">
                 today's circuit leaderboard
                 {canShowKeyboard() && (
-                  <button className="kb-toggle" onClick={() => setShowKb((s) => !s)}>{showKb ? "hide keys" : "show keys"}</button>
+                  <button className="kb-toggle" onClick={toggleKeyboard}>{showKb ? "hide keys" : "show keys"}</button>
                 )}
               </div>
               {board === null ? (
